@@ -338,6 +338,17 @@ pub fn push_authorship_notes(repository: &Repository, remote_name: &str) -> Resu
         return Ok(());
     }
 
+    // Repository filters apply to the push target itself: a repository allowed
+    // through one remote must not send notes to a remote the filters reject.
+    // Checked before the pre-push fetch so a rejected remote is not contacted.
+    if !crate::config::Config::fresh().may_sync_notes_with_remote(repository, remote_name) {
+        tracing::debug!(
+            remote = remote_name,
+            "push_authorship_notes: skipping, remote rejected by repository filters"
+        );
+        return Ok(());
+    }
+
     let mut last_error = None;
 
     for attempt in 0..PUSH_NOTES_MAX_ATTEMPTS {

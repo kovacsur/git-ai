@@ -153,6 +153,98 @@ fn push_to_remote_outside_allowlist_sends_no_notes_even_if_repo_is_allowed() {
     );
 }
 
+/// Positive control: with filters configured, a push to an allowed remote
+/// still syncs notes.
+#[test]
+fn push_to_allowed_remote_syncs_notes_when_filters_are_set() {
+    let (local, gitlab) = TestRepo::new_with_remote_with_daemon_scope(DaemonTestScope::Dedicated);
+    set_remote(&local, "origin", GITLAB_URL, gitlab.path());
+    set_repository_filters(
+        &local,
+        &["https://gitlab.example.com/*"],
+        &["https://github.com/*"],
+    );
+
+    let mut file = local.filename("ai.txt");
+    file.set_contents(vec!["line from an agent".ai()]);
+    let sha = commit_all(&local, "agent change in allowed repo");
+    local.git(&["push", "origin", "HEAD:main"]).unwrap();
+
+    assert!(
+        local
+            .read_authorship_note_in_git_dir(gitlab.path(), &sha)
+            .is_some(),
+        "notes must still be pushed to a remote the filters allow"
+    );
+}
+
+/// `git push <url>` targets a URL, not a configured remote name; the URL itself
+/// must pass the filters.
+#[test]
+fn push_to_literal_excluded_url_sends_no_notes() {
+    let (local, gitlab) = TestRepo::new_with_remote_with_daemon_scope(DaemonTestScope::Dedicated);
+    let github = TestRepo::new_bare_with_daemon_scope(DaemonTestScope::NoDaemon);
+    set_remote(&local, "origin", GITLAB_URL, gitlab.path());
+    local
+        .git_og(&[
+            "config",
+            &format!("url.{}.insteadOf", github.path().to_str().unwrap()),
+            GITHUB_URL,
+        ])
+        .unwrap();
+    set_repository_filters(&local, &[], &["https://github.com/*"]);
+
+    let mut file = local.filename("ai.txt");
+    file.set_contents(vec!["line from an agent".ai()]);
+    commit_all(&local, "agent change");
+    local.git(&["push", GITHUB_URL, "HEAD:main"]).unwrap();
+    local.sync_daemon_force();
+
+    assert_eq!(
+        notes_refs(&github),
+        "",
+        "notes must not be pushed to an excluded URL given on the command line"
+    );
+}
+
+/// git pushes to `pushurl` when one is set, so the filters must check it, not
+/// only `url`.
+#[test]
+fn push_via_pushurl_outside_allowlist_sends_no_notes() {
+    let (local, gitlab) = TestRepo::new_with_remote_with_daemon_scope(DaemonTestScope::Dedicated);
+    let github = TestRepo::new_bare_with_daemon_scope(DaemonTestScope::NoDaemon);
+    set_remote(&local, "origin", GITLAB_URL, gitlab.path());
+    local
+        .git_og(&["config", "remote.origin.pushurl", GITHUB_URL])
+        .unwrap();
+    local
+        .git_og(&[
+            "config",
+            &format!("url.{}.insteadOf", github.path().to_str().unwrap()),
+            GITHUB_URL,
+        ])
+        .unwrap();
+    set_repository_filters(&local, &["https://gitlab.example.com/*"], &[]);
+
+    let mut file = local.filename("ai.txt");
+    file.set_contents(vec!["line from an agent".ai()]);
+    commit_all(&local, "agent change");
+    local.git(&["push", "origin", "HEAD:main"]).unwrap();
+    local.sync_daemon_force();
+
+    assert!(
+        github
+            .git_og(&["rev-parse", "--verify", "refs/heads/main"])
+            .is_ok(),
+        "precondition: the branch push went to the pushurl"
+    );
+    assert_eq!(
+        notes_refs(&github),
+        "",
+        "notes must not be pushed to a pushurl outside allow_repositories"
+    );
+}
+
 fn file_mtime_secs(path: &Path) -> u32 {
     fs::metadata(path)
         .unwrap()
