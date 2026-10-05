@@ -109,6 +109,75 @@ fn excluded_repository_checkpoint_is_skipped_and_commit_writes_no_note() {
 }
 
 #[test]
+fn excluded_repository_amend_writes_no_authorship_note() {
+    let (local, _upstream) = filtered_repo_with_remote();
+
+    fs::write(local.path().join("human.txt"), "written by a human\n").unwrap();
+    commit_all(&local, "human change in excluded repo");
+    fs::write(local.path().join("human.txt"), "amended by a human\n").unwrap();
+    local.git(&["add", "-A"]).unwrap();
+    local.git(&["commit", "--amend", "--no-edit"]).unwrap();
+    let amended = head_sha(&local);
+
+    assert_eq!(
+        local.read_authorship_note(&amended),
+        None,
+        "amending a commit in an excluded repository must not write a note"
+    );
+}
+
+#[test]
+fn repository_excluded_after_checkpoints_drops_its_working_log_on_commit() {
+    let (local, upstream) = TestRepo::new_with_remote_with_daemon_scope(DaemonTestScope::Dedicated);
+    set_remote(&local, "origin", GITHUB_URL, upstream.path());
+    fs::write(local.path().join("README.md"), "base\n").unwrap();
+    let base = commit_all(&local, "base");
+
+    // Checkpoints recorded while the repository is still tracked.
+    local
+        .filename("committed.txt")
+        .set_contents(vec!["committed agent line".ai()]);
+    local
+        .filename("uncommitted.txt")
+        .set_contents(vec!["uncommitted agent line".ai()]);
+    assert!(
+        !local
+            .working_logs_for_base_commit(&base)
+            .read_all_checkpoints()
+            .unwrap()
+            .is_empty(),
+        "precondition: AI checkpoints were recorded before the repository was excluded"
+    );
+
+    set_repository_filters(&local, &[], &["https://github.com/*"]);
+    local.git(&["add", "committed.txt"]).unwrap();
+    local
+        .git(&["commit", "-m", "commit after exclusion"])
+        .unwrap();
+    let sha = head_sha(&local);
+
+    assert_eq!(
+        local.read_authorship_note(&sha),
+        None,
+        "checkpoints recorded before the exclusion must not produce a note"
+    );
+    assert!(
+        local
+            .working_logs_for_base_commit(&base)
+            .read_all_checkpoints()
+            .unwrap()
+            .is_empty(),
+        "the old base's working log must be dropped"
+    );
+    let carried = local.working_logs_for_base_commit(&sha);
+    assert!(
+        carried.read_all_checkpoints().unwrap().is_empty()
+            && carried.read_initial_attributions().files.is_empty(),
+        "uncommitted AI attributions must not be carried to the new commit"
+    );
+}
+
+#[test]
 fn excluded_repository_push_sends_no_notes_to_remote() {
     let (local, upstream) = filtered_repo_with_remote();
 
@@ -306,5 +375,64 @@ fn excluded_repository_commit_does_not_recover_ai_session_into_note() {
         None,
         "no note may be written for an excluded repo; recovered session {session_id} present: {}",
         note.as_deref().is_some_and(|n| n.contains(&session_id))
+    );
+}
+
+/// A tracked repository with an AI-authored commit on `feature` (which has a
+/// note) and one extra commit on the default branch; the repository is then
+/// excluded. Returns (repo, default branch, feature commit).
+fn repo_excluded_after_noted_feature_commit() -> (TestRepo, TestRepo, String, String) {
+    let (local, upstream) = TestRepo::new_with_remote_with_daemon_scope(DaemonTestScope::Dedicated);
+    set_remote(&local, "origin", GITHUB_URL, upstream.path());
+    fs::write(local.path().join("README.md"), "base\n").unwrap();
+    commit_all(&local, "base");
+    let main_branch = local.current_branch();
+
+    local.git(&["checkout", "-b", "feature"]).unwrap();
+    local
+        .filename("feature.txt")
+        .set_contents(vec!["agent feature line".ai()]);
+    let feature = commit_all(&local, "agent feature");
+    assert!(
+        local.read_authorship_note(&feature).is_some(),
+        "precondition: the feature commit got a note while the repository was tracked"
+    );
+
+    local.git(&["checkout", &main_branch]).unwrap();
+    fs::write(local.path().join("main.txt"), "main moves on\n").unwrap();
+    commit_all(&local, "main moves on");
+
+    set_repository_filters(&local, &[], &["https://github.com/*"]);
+    (local, upstream, main_branch, feature)
+}
+
+#[test]
+fn excluded_repository_cherry_pick_copies_no_note() {
+    let (local, _upstream, _main, feature) = repo_excluded_after_noted_feature_commit();
+
+    local.git(&["cherry-pick", &feature]).unwrap();
+    let picked = head_sha(&local);
+
+    assert_ne!(picked, feature);
+    assert_eq!(
+        local.read_authorship_note(&picked),
+        None,
+        "cherry-pick in an excluded repository must not copy the source note"
+    );
+}
+
+#[test]
+fn excluded_repository_rebase_copies_no_note() {
+    let (local, _upstream, main_branch, feature) = repo_excluded_after_noted_feature_commit();
+
+    local.git(&["checkout", "feature"]).unwrap();
+    local.git(&["rebase", &main_branch]).unwrap();
+    let rebased = head_sha(&local);
+
+    assert_ne!(rebased, feature);
+    assert_eq!(
+        local.read_authorship_note(&rebased),
+        None,
+        "rebase in an excluded repository must not carry the note to the rewritten commit"
     );
 }

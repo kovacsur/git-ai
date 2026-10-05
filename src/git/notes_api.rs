@@ -18,7 +18,22 @@ pub use crate::git::refs::CommitAuthorship;
 
 // --- Writes ---
 
+/// Backstop for every authorship-note writer (post-commit, rebase/cherry-pick/
+/// reset/stash rewrites, revert, untraced-commit fixup): a repository the
+/// repository filters reject gets no note on either backend. Reads a fresh
+/// config so the long-lived daemon sees filter changes without a restart.
+fn repository_accepts_notes(repo: &Repository) -> bool {
+    let tracked = Config::fresh().tracks_repository(repo);
+    if !tracked {
+        tracing::debug!("repository filters exclude this repository; authorship note not written");
+    }
+    tracked
+}
+
 pub fn write_note(repo: &Repository, commit_sha: &str, content: &str) -> Result<(), GitAiError> {
+    if !repository_accepts_notes(repo) {
+        return Ok(());
+    }
     match Config::get().notes_backend_kind() {
         NotesBackendKind::Http => http_write_note(commit_sha, content),
         NotesBackendKind::GitNotes => crate::git::refs::notes_add(repo, commit_sha, content),
@@ -29,7 +44,7 @@ pub fn write_notes_batch(
     repo: &Repository,
     entries: &[(String, String)],
 ) -> Result<(), GitAiError> {
-    if entries.is_empty() {
+    if entries.is_empty() || !repository_accepts_notes(repo) {
         return Ok(());
     }
     match Config::get().notes_backend_kind() {
