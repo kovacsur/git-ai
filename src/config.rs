@@ -433,6 +433,58 @@ impl Config {
         !self.allow_repositories.is_empty() || !self.exclude_repositories.is_empty()
     }
 
+    /// Whether git-ai tracks `repository` at all. A repository rejected by
+    /// `allow_repositories` / `exclude_repositories` gets no git-ai side effects:
+    /// no checkpoints, authorship notes, or metrics. Long-lived processes (the
+    /// daemon) should call this on `Config::fresh()` so filter changes apply
+    /// without a restart.
+    pub fn tracks_repository(&self, repository: &Repository) -> bool {
+        if !self.has_repository_filters() {
+            return true;
+        }
+        let remotes = repository.remotes_with_urls().ok();
+        self.is_allowed_repository_with_remotes(remotes.as_ref())
+    }
+
+    /// Whether authorship notes may be pushed to or fetched from `remote` (a
+    /// remote name or a URL). The repository must be tracked, and every URL git
+    /// may use for `remote` must pass the filters: a repository allowed through
+    /// one remote must not sync notes with another remote the filters reject.
+    /// Fails closed when the URLs cannot be determined.
+    pub fn may_sync_notes_with_remote(&self, repository: &Repository, remote: &str) -> bool {
+        if !self.has_repository_filters() {
+            return true;
+        }
+        if !self.tracks_repository(repository) {
+            return false;
+        }
+        repository
+            .remote_transfer_urls(remote)
+            .is_ok_and(|urls| self.is_allowed_remote_urls(&urls))
+    }
+
+    pub(crate) fn is_allowed_remote_urls(&self, urls: &[String]) -> bool {
+        if urls
+            .iter()
+            .any(|url| crate::diagnostic_sentinels::is_debug_self_check_remote_url(url))
+        {
+            return true;
+        }
+        if urls.is_empty() {
+            return false;
+        }
+        if urls
+            .iter()
+            .any(|url| remote_matches_patterns(&self.exclude_repositories, url))
+        {
+            return false;
+        }
+        self.allow_repositories.is_empty()
+            || urls
+                .iter()
+                .all(|url| remote_matches_patterns(&self.allow_repositories, url))
+    }
+
     pub fn is_allowed_repository(&self, repository: &Option<Repository>) -> bool {
         // Fetch remotes once and reuse for both exclude and allow checks
         let remotes = repository
@@ -2594,6 +2646,50 @@ mod tests {
     fn test_no_remotes_denied_when_allowlist_active() {
         let config = create_test_config(vec!["https://github.com/myorg/*".to_string()], vec![]);
         assert!(!config.is_allowed_repository_with_remotes(None));
+    }
+
+    fn urls(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn test_remote_urls_denied_when_any_url_excluded() {
+        let config = create_test_config(vec![], vec!["https://github.com/*".to_string()]);
+        assert!(!config.is_allowed_remote_urls(&urls(&[
+            "https://gitlab.example.com/org/repo.git",
+            "https://github.com/org/repo.git",
+        ])));
+        assert!(config.is_allowed_remote_urls(&urls(&["https://gitlab.example.com/org/repo.git"])));
+    }
+
+    #[test]
+    fn test_remote_urls_need_every_url_in_allowlist() {
+        let config = create_test_config(vec!["https://gitlab.example.com/*".to_string()], vec![]);
+        assert!(config.is_allowed_remote_urls(&urls(&["https://gitlab.example.com/org/repo.git"])));
+        assert!(!config.is_allowed_remote_urls(&urls(&[
+            "https://gitlab.example.com/org/repo.git",
+            "https://github.com/org/repo.git",
+        ])));
+    }
+
+    #[test]
+    fn test_remote_urls_fail_closed_when_empty() {
+        let config = create_test_config(vec![], vec!["https://github.com/*".to_string()]);
+        assert!(!config.is_allowed_remote_urls(&[]));
+    }
+
+    #[test]
+    fn test_remote_urls_exclusion_matches_scp_form() {
+        let config = create_test_config(vec![], vec!["https://github.com/org/*".to_string()]);
+        assert!(!config.is_allowed_remote_urls(&urls(&["git@github.com:org/repo.git"])));
+    }
+
+    #[test]
+    fn test_remote_urls_allow_debug_self_check_sentinel() {
+        let config = create_test_config(vec!["https://gitlab.example.com/*".to_string()], vec![]);
+        assert!(config.is_allowed_remote_urls(&urls(&[
+            crate::diagnostic_sentinels::DEBUG_SELF_CHECK_REMOTE_URL
+        ])));
     }
 
     #[test]

@@ -1297,6 +1297,33 @@ impl Repository {
         Ok(remotes)
     }
 
+    /// URLs git may contact when transferring with `remote`: every configured
+    /// `url` and `pushurl` of a named remote, or `remote` itself when it is not
+    /// a configured remote name (e.g. `git push https://host/repo.git`).
+    pub fn remote_transfer_urls(&self, remote: &str) -> Result<Vec<String>, GitAiError> {
+        let config = self.get_git_config_file()?;
+        let mut urls = Vec::new();
+        let mut is_named_remote = false;
+
+        for section in config.sections() {
+            if !section.header().name().eq_ignore_ascii_case(b"remote") {
+                continue;
+            }
+            if section.header().subsection_name() != Some(remote.as_bytes().into()) {
+                continue;
+            }
+            is_named_remote = true;
+            for key in ["url", "pushurl"] {
+                urls.extend(section.body().values(key).iter().map(|url| url.to_string()));
+            }
+        }
+
+        if !is_named_remote {
+            urls.push(remote.to_string());
+        }
+        Ok(urls)
+    }
+
     fn load_optional_config_file(
         path: &Path,
         source: gix_config::Source,
