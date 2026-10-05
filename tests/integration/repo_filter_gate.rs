@@ -7,9 +7,10 @@
 
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::{DaemonTestScope, TestRepo};
-use crate::test_utils::isolated_metrics_db_path;
+use crate::test_utils::{codex_checkpoint, isolated_metrics_db_path};
 use git_ai::authorship::authorship_log_serialization::generate_session_id;
 use git_ai::metrics::db::MetricsDatabase;
+use git_ai::metrics::types::MetricEventId;
 use git_ai::metrics::{EventAttributes, MetricEvent, PosEncoded, SessionEventValues};
 use serde_json::json;
 use std::fs;
@@ -746,4 +747,141 @@ fn natively_fetched_notes_are_readable_in_excluded_repository() {
     local
         .filename("ai.txt")
         .assert_lines_and_blame(vec!["line from an agent".ai()]);
+}
+
+/// Run `git ai notes migrate` in a repository with a local note, against an
+/// HTTP backend that is unroutable on purpose. Returns the command output,
+/// whether it succeeded or not.
+fn notes_migrate_output(exclude: &[&str]) -> String {
+    let (local, upstream) = TestRepo::new_with_remote_with_daemon_scope(DaemonTestScope::Dedicated);
+    set_remote(&local, "origin", GITHUB_URL, upstream.path());
+    fs::write(local.path().join("a.txt"), "a\n").unwrap();
+    let sha = commit_all(&local, "commit with a note");
+    local
+        .git_og(&[
+            "notes",
+            "--ref=ai",
+            "add",
+            "-f",
+            "-m",
+            "existing note",
+            &sha,
+        ])
+        .unwrap();
+    set_repository_filters(&local, &[], exclude);
+    set_config_value(
+        &local,
+        "notes_backend",
+        json!({"kind": "http", "backend_url": "http://127.0.0.1:9"}),
+    );
+    set_config_value(&local, "api_key", json!("test-key"));
+
+    local
+        .git_ai(&["notes", "migrate"])
+        .unwrap_or_else(|output| output)
+}
+
+#[test]
+fn notes_migrate_in_allowed_repository_uploads() {
+    let output = notes_migrate_output(&["https://gitlab.example.com/*"]);
+    assert!(
+        output.contains("Found 1 note(s)"),
+        "positive control: migrate reads the note and tries to upload it: {output}"
+    );
+}
+
+#[test]
+fn notes_migrate_in_excluded_repository_uploads_nothing() {
+    let output = notes_migrate_output(&["https://github.com/*"]);
+    assert!(output.contains("Skipped migrating notes"), "{output}");
+    assert!(
+        output.contains("remove 'https://github.com/*' from exclude_repositories"),
+        "the hint says how to change the filters: {output}"
+    );
+    assert!(
+        !output.contains("Listing notes") && !output.contains("chunk"),
+        "nothing is read or uploaded: {output}"
+    );
+}
+
+/// Rebase an AI-authored `feature` commit after setting `exclude` (origin =
+/// GITHUB_URL). Returns the RewriteCommitted metrics persisted for the rebase.
+fn rewrite_metrics_after_rebase(exclude: &[&str]) -> Vec<MetricEvent> {
+    let (_metrics_db_dir, metrics_db_path) = isolated_metrics_db_path();
+    let local =
+        TestRepo::new_with_daemon_env(&[("GIT_AI_TEST_METRICS_DB_PATH", metrics_db_path.as_str())]);
+    local
+        .git_og(&["remote", "add", "origin", GITHUB_URL])
+        .unwrap();
+    fs::write(local.path().join("README.md"), "base\n").unwrap();
+    commit_all(&local, "base");
+    let main_branch = local.current_branch();
+
+    local.git(&["checkout", "-b", "feature"]).unwrap();
+    // A real preset: mock presets are excluded from commit metrics.
+    let feature_file = local.path().join("feature.txt");
+    codex_checkpoint(
+        &local,
+        &feature_file,
+        "codex-rebase",
+        "PreToolUse",
+        "tool-1",
+    );
+    fs::write(&feature_file, "agent feature line\n").unwrap();
+    codex_checkpoint(
+        &local,
+        &feature_file,
+        "codex-rebase",
+        "PostToolUse",
+        "tool-1",
+    );
+    let feature = commit_all(&local, "agent feature");
+    local.git(&["checkout", &main_branch]).unwrap();
+    fs::write(local.path().join("main.txt"), "main moves on\n").unwrap();
+    commit_all(&local, "main moves on");
+    assert!(
+        local.read_authorship_note(&feature).is_some(),
+        "precondition: the feature commit got a note while the repository was tracked"
+    );
+    // The daemon handles commits asynchronously: finish them before excluding.
+    local.sync_daemon_force();
+
+    set_repository_filters(&local, &[], exclude);
+    local.git(&["checkout", "feature"]).unwrap();
+    local.git(&["rebase", &main_branch]).unwrap();
+    local.sync_daemon_force();
+
+    // Rewrite metrics are built on a background task after the rewrite is
+    // processed, so poll; an excluded repository waits out the deadline.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let events: Vec<MetricEvent> = MetricsDatabase::open_at_path(Path::new(&metrics_db_path))
+            .unwrap()
+            .get_metric_history(0, None, &[MetricEventId::RewriteCommitted as u16])
+            .unwrap()
+            .into_iter()
+            .map(|record| record.event)
+            .collect();
+        if !events.is_empty() || std::time::Instant::now() >= deadline {
+            return events;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn rebase_in_allowed_repository_records_rewrite_metrics() {
+    assert!(
+        !rewrite_metrics_after_rebase(&["https://gitlab.example.com/*"]).is_empty(),
+        "positive control: a rebase in a tracked repository records RewriteCommitted"
+    );
+}
+
+#[test]
+fn excluded_repository_rebase_records_no_rewrite_metrics() {
+    let events = rewrite_metrics_after_rebase(&["https://github.com/*"]);
+    assert!(
+        events.is_empty(),
+        "a rebase in an excluded repository must not record RewriteCommitted: {events:?}"
+    );
 }

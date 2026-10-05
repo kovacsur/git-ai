@@ -34,6 +34,39 @@ pub enum RepositoryFilterRejection {
     NotAllowed { url: Option<String> },
 }
 
+impl RepositoryFilterRejection {
+    /// The rule that matched, e.g. `<url> matches exclude_repositories pattern '<p>'`.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Excluded { pattern, url } => {
+                format!("{} matches exclude_repositories pattern '{}'", url, pattern)
+            }
+            Self::NotAllowed { url: Some(url) } => {
+                format!("{} matches no allow_repositories pattern", url)
+            }
+            Self::NotAllowed { url: None } => {
+                "its URL matches no allow_repositories pattern".to_string()
+            }
+        }
+    }
+
+    /// How to change the filters so the rule no longer matches.
+    pub fn how_to_change_filters(&self) -> String {
+        match self {
+            Self::Excluded { pattern, .. } => format!(
+                "remove '{}' from exclude_repositories (see 'git ai config exclude_repositories')",
+                pattern
+            ),
+            Self::NotAllowed { url: Some(url) } => {
+                format!("allow it: git ai config --add allow_repositories {}", url)
+            }
+            Self::NotAllowed { url: None } => {
+                "add it to allow_repositories (see 'git ai config allow_repositories')".to_string()
+            }
+        }
+    }
+}
+
 /// Which backend to use for storing authorship notes.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -473,9 +506,17 @@ impl Config {
             .is_ok_and(|urls| self.is_allowed_remote_urls(&urls))
     }
 
+    /// Why [`Self::tracks_repository`] rejects `repository`, for user-facing
+    /// hints. `None` when the repository is tracked.
+    pub fn tracking_rejection(&self, repository: &Repository) -> Option<RepositoryFilterRejection> {
+        if self.tracks_repository(repository) {
+            return None;
+        }
+        Some(self.filter_rejection(Self::repository_urls(repository)))
+    }
+
     /// Why [`Self::may_sync_notes_with_remote`] rejects `remote`, for user-facing
-    /// hints. `None` when notes may be synced. An exclude match on any remote of
-    /// the repository is reported first, because exclusions take precedence.
+    /// hints. `None` when notes may be synced.
     pub fn notes_sync_rejection(
         &self,
         repository: &Repository,
@@ -485,29 +526,39 @@ impl Config {
             return None;
         }
         let mut urls = repository.remote_transfer_urls(remote).unwrap_or_default();
-        urls.extend(
-            repository
-                .remotes_with_urls()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(_, url)| url),
-        );
+        urls.extend(Self::repository_urls(repository));
+        Some(self.filter_rejection(urls))
+    }
+
+    fn repository_urls(repository: &Repository) -> Vec<String> {
+        repository
+            .remotes_with_urls()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, url)| url)
+            .collect()
+    }
+
+    /// The rule that rejects `urls`: an exclude match is reported first,
+    /// because exclusions take precedence; else the first URL outside the
+    /// allowlist.
+    fn filter_rejection(&self, urls: Vec<String>) -> RepositoryFilterRejection {
         for url in &urls {
             if let Some(pattern) = self
                 .exclude_repositories
                 .iter()
                 .find(|pattern| remote_matches_patterns(std::slice::from_ref(*pattern), url))
             {
-                return Some(RepositoryFilterRejection::Excluded {
+                return RepositoryFilterRejection::Excluded {
                     pattern: pattern.as_str().to_string(),
                     url: url.clone(),
-                });
+                };
             }
         }
         let url = urls
             .into_iter()
             .find(|url| !remote_matches_patterns(&self.allow_repositories, url));
-        Some(RepositoryFilterRejection::NotAllowed { url })
+        RepositoryFilterRejection::NotAllowed { url }
     }
 
     pub(crate) fn is_allowed_remote_urls(&self, urls: &[String]) -> bool {

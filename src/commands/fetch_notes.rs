@@ -198,23 +198,8 @@ fn print_filter_skip_hint(
     rejection: &RepositoryFilterRejection,
     backend: NotesBackendKind,
 ) {
-    let (reason, change_filters) = match rejection {
-        RepositoryFilterRejection::Excluded { pattern, url } => (
-            format!("{} matches exclude_repositories pattern '{}'", url, pattern),
-            format!(
-                "remove '{}' from exclude_repositories (see 'git ai config exclude_repositories')",
-                pattern
-            ),
-        ),
-        RepositoryFilterRejection::NotAllowed { url: Some(url) } => (
-            format!("{} matches no allow_repositories pattern", url),
-            format!("allow it: git ai config --add allow_repositories {}", url),
-        ),
-        RepositoryFilterRejection::NotAllowed { url: None } => (
-            "its URL matches no allow_repositories pattern".to_string(),
-            "add it to allow_repositories (see 'git ai config allow_repositories')".to_string(),
-        ),
-    };
+    let reason = rejection.reason();
+    let change_filters = rejection.how_to_change_filters();
     eprintln!(
         "Skipped fetching authorship notes from '{}': the repository filters reject it ({}).",
         remote, reason
