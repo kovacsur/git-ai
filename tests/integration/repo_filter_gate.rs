@@ -804,6 +804,34 @@ fn notes_migrate_in_excluded_repository_uploads_nothing() {
     );
 }
 
+/// With filters set, a checkpoint for a repository git-ai cannot resolve (here
+/// a `.git` file pointing nowhere) is skipped: the filters cannot be checked,
+/// so it is treated as not allowed.
+#[test]
+fn checkpoint_in_unresolvable_repository_is_skipped_when_filters_are_set() {
+    let (local, _upstream) =
+        TestRepo::new_with_remote_with_daemon_scope(DaemonTestScope::Dedicated);
+    set_repository_filters(&local, &[], &["https://github.com/*"]);
+
+    let broken = tempfile::tempdir().unwrap();
+    fs::write(
+        broken.path().join(".git"),
+        format!("gitdir: {}\n", broken.path().join("missing").display()),
+    )
+    .unwrap();
+    let file = broken.path().join("a.txt");
+    fs::write(&file, "agent line\n").unwrap();
+
+    let output = local
+        .git_ai(&["checkpoint", "mock_ai", file.to_str().unwrap()])
+        .unwrap_or_else(|output| output);
+
+    assert!(
+        output.contains("Skipping checkpoint"),
+        "an unresolvable repository must not pass the filters: {output}"
+    );
+}
+
 /// Rebase an AI-authored `feature` commit after setting `exclude` (origin =
 /// GITHUB_URL). Returns the RewriteCommitted metrics persisted for the rebase.
 fn rewrite_metrics_after_rebase(exclude: &[&str]) -> Vec<MetricEvent> {

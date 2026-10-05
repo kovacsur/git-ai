@@ -478,15 +478,19 @@ impl Config {
 
     /// Whether git-ai tracks `repository` at all. A repository rejected by
     /// `allow_repositories` / `exclude_repositories` gets no git-ai side effects:
-    /// no checkpoints, authorship notes, or metrics. Long-lived processes (the
+    /// no checkpoints, authorship notes, or metrics. With filters set, a
+    /// repository whose remotes cannot be read is not tracked. Long-lived processes (the
     /// daemon) should call this on `Config::fresh()` so filter changes apply
     /// without a restart.
     pub fn tracks_repository(&self, repository: &Repository) -> bool {
         if !self.has_repository_filters() {
             return true;
         }
-        let remotes = repository.remotes_with_urls().ok();
-        self.is_allowed_repository_with_remotes(remotes.as_ref())
+        // Fail closed: remotes that cannot be read cannot be checked.
+        let Ok(remotes) = repository.remotes_with_urls() else {
+            return false;
+        };
+        self.is_allowed_repository_with_remotes(Some(&remotes))
     }
 
     /// Whether authorship notes may be pushed to or fetched from `remote` (a
@@ -2748,6 +2752,39 @@ mod tests {
 
     fn urls(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    /// A repository in a temp dir with `.git/config` set to `config_text`.
+    fn repository_with_git_config(config_text: &str) -> (tempfile::TempDir, Repository) {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir_all(git_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(git_dir.join("refs")).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(git_dir.join("config"), config_text).unwrap();
+        let repo =
+            crate::git::repository::discover_repository_in_path_no_git_exec(dir.path()).unwrap();
+        (dir, repo)
+    }
+
+    #[test]
+    fn test_tracks_repository_with_readable_remotes() {
+        let config = create_test_config(vec![], vec!["https://github.com/*".to_string()]);
+        let (_dir, repo) = repository_with_git_config(
+            "[remote \"origin\"]\n\turl = https://gitlab.example.com/org/repo.git\n",
+        );
+        assert!(config.tracks_repository(&repo));
+    }
+
+    #[test]
+    fn test_tracks_repository_fails_closed_when_remotes_unreadable() {
+        let config = create_test_config(vec![], vec!["https://github.com/*".to_string()]);
+        let (_dir, repo) = repository_with_git_config("[remote \"origin\"\n\turl = x\n");
+        assert!(
+            repo.remotes_with_urls().is_err(),
+            "precondition: the config cannot be read"
+        );
+        assert!(!config.tracks_repository(&repo));
     }
 
     #[test]
