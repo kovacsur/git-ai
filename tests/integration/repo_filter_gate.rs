@@ -436,3 +436,314 @@ fn excluded_repository_rebase_copies_no_note() {
         "rebase in an excluded repository must not carry the note to the rewritten commit"
     );
 }
+
+/// Give `bare` a commit carrying a `refs/notes/ai` note, written with raw git
+/// (`git_og`) so the seed does not depend on git-ai. Returns the noted commit.
+fn seed_remote_with_note(bare: &TestRepo) -> String {
+    let seed = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
+    fs::write(seed.path().join("seed.txt"), "seed\n").unwrap();
+    seed.git_og(&["add", "-A"]).unwrap();
+    seed.git_og(&["commit", "-q", "-m", "seed"]).unwrap();
+    seed.git_og(&["notes", "--ref=ai", "add", "-m", "seeded note", "HEAD"])
+        .unwrap();
+    seed.git_og(&[
+        "push",
+        "-q",
+        bare.path().to_str().unwrap(),
+        "HEAD:refs/heads/main",
+        "refs/notes/ai:refs/notes/ai",
+    ])
+    .unwrap();
+    assert!(!notes_refs(bare).is_empty());
+    head_sha(&seed)
+}
+
+/// Pull from origin = GITHUB_URL (transport: `upstream`) after seeding a note
+/// there. Returns the notes refs the local repo ends up with.
+fn notes_refs_after_pull(exclude: &[&str]) -> String {
+    let (local, upstream) = TestRepo::new_with_remote_with_daemon_scope(DaemonTestScope::Dedicated);
+    set_remote(&local, "origin", GITHUB_URL, upstream.path());
+    seed_remote_with_note(&upstream);
+    set_repository_filters(&local, &[], exclude);
+
+    local.git(&["pull", "origin", "main"]).unwrap();
+    local.sync_daemon_force();
+    notes_refs(&local)
+}
+
+#[test]
+fn pull_into_allowed_repository_fetches_notes() {
+    assert_ne!(
+        notes_refs_after_pull(&["https://gitlab.example.com/*"]),
+        "",
+        "positive control: pull in a tracked repository fetches refs/notes/ai"
+    );
+}
+
+#[test]
+fn excluded_repository_pull_fetches_no_notes() {
+    assert_eq!(
+        notes_refs_after_pull(&["https://github.com/*"]),
+        "",
+        "pull in an excluded repository must not fetch refs/notes/ai"
+    );
+}
+
+/// Clone GITHUB_URL (transport: a seeded bare repo; the `insteadOf` is set in
+/// the new clone with `--config`, so later fetches resolve it too). Returns the
+/// notes refs of the clone.
+fn notes_refs_after_clone(exclude: &[&str]) -> String {
+    let (local, _upstream) =
+        TestRepo::new_with_remote_with_daemon_scope(DaemonTestScope::Dedicated);
+    let bare = TestRepo::new_bare_with_daemon_scope(DaemonTestScope::NoDaemon);
+    seed_remote_with_note(&bare);
+    set_repository_filters(&local, &[], exclude);
+
+    let target_dir = tempfile::tempdir().unwrap();
+    let target = target_dir.path().join("clone");
+    local
+        .git(&[
+            "clone",
+            &format!(
+                "--config=url.{}.insteadOf={}",
+                bare.path().display(),
+                GITHUB_URL
+            ),
+            GITHUB_URL,
+            target.to_str().unwrap(),
+        ])
+        .unwrap();
+    notes_refs(&TestRepo::new_at_path_with_daemon_scope(
+        &target,
+        DaemonTestScope::NoDaemon,
+    ))
+}
+
+#[test]
+fn clone_of_allowed_repository_fetches_notes() {
+    assert_ne!(
+        notes_refs_after_clone(&["https://gitlab.example.com/*"]),
+        "",
+        "positive control: cloning a tracked repository fetches refs/notes/ai"
+    );
+}
+
+#[test]
+fn excluded_repository_clone_fetches_no_notes() {
+    assert_eq!(
+        notes_refs_after_clone(&["https://github.com/*"]),
+        "",
+        "cloning an excluded repository must not fetch refs/notes/ai"
+    );
+}
+
+/// Cherry-pick a commit whose note exists only on origin. Rewrites fetch
+/// missing source notes from every remote; returns the notes refs the local
+/// repo ends up with.
+fn notes_refs_after_cherry_pick_of_remote_noted_commit(exclude: &[&str]) -> String {
+    let (local, upstream) = TestRepo::new_with_remote_with_daemon_scope(DaemonTestScope::Dedicated);
+    set_remote(&local, "origin", GITHUB_URL, upstream.path());
+    let noted = seed_remote_with_note(&upstream);
+    local.git_og(&["fetch", "origin", "main"]).unwrap();
+    assert_eq!(notes_refs(&local), "", "precondition: no notes yet");
+    set_repository_filters(&local, &[], exclude);
+
+    fs::write(local.path().join("local.txt"), "local\n").unwrap();
+    commit_all(&local, "local base");
+    local.git(&["cherry-pick", &noted]).unwrap();
+    local.sync_daemon_force();
+    notes_refs(&local)
+}
+
+#[test]
+fn cherry_pick_in_allowed_repository_fetches_missing_source_note() {
+    assert_ne!(
+        notes_refs_after_cherry_pick_of_remote_noted_commit(&["https://gitlab.example.com/*"]),
+        "",
+        "positive control: a rewrite fetches the source note from origin"
+    );
+}
+
+#[test]
+fn excluded_repository_cherry_pick_fetches_no_source_notes() {
+    assert_eq!(
+        notes_refs_after_cherry_pick_of_remote_noted_commit(&["https://github.com/*"]),
+        "",
+        "a rewrite in an excluded repository must not fetch notes from its remotes"
+    );
+}
+
+/// A repository allowed via its GitLab origin must not fetch source notes from
+/// a GitHub remote the allowlist does not cover.
+#[test]
+fn cherry_pick_fetches_no_source_notes_from_remote_outside_allowlist() {
+    let (local, gitlab) = TestRepo::new_with_remote_with_daemon_scope(DaemonTestScope::Dedicated);
+    let github = TestRepo::new_bare_with_daemon_scope(DaemonTestScope::NoDaemon);
+    set_remote(&local, "origin", GITLAB_URL, gitlab.path());
+    set_remote(&local, "upstream", GITHUB_URL, github.path());
+    let noted = seed_remote_with_note(&github);
+    local.git_og(&["fetch", "upstream", "main"]).unwrap();
+    set_repository_filters(&local, &["https://gitlab.example.com/*"], &[]);
+
+    fs::write(local.path().join("local.txt"), "local\n").unwrap();
+    commit_all(&local, "local base");
+    local.git(&["cherry-pick", &noted]).unwrap();
+    local.sync_daemon_force();
+
+    let refs = notes_refs(&local);
+    assert!(
+        !refs.contains("ai-remote/upstream"),
+        "notes must not be fetched from a remote outside allow_repositories: {refs}"
+    );
+    assert_eq!(
+        local.read_authorship_note(&head_sha(&local)),
+        None,
+        "the cherry-pick must not pick up the note held only by the rejected remote"
+    );
+}
+
+/// Merge `key: value` into the git-ai config the CLI and the daemon read.
+fn set_config_value(repo: &TestRepo, key: &str, value: serde_json::Value) {
+    let mut homes = vec![repo.test_home_path().clone(), repo.daemon_home_path()];
+    homes.dedup();
+    for home in homes {
+        let config_path = home.join(".git-ai/config.json");
+        let mut config: serde_json::Map<String, serde_json::Value> =
+            fs::read_to_string(&config_path)
+                .ok()
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or_default();
+        config.insert(key.to_string(), value.clone());
+        fs::write(&config_path, serde_json::to_string(&config).unwrap()).unwrap();
+    }
+}
+
+const NATIVE_FETCH_HINT: &str = "git fetch origin refs/notes/ai:refs/notes/ai";
+
+#[test]
+fn fetch_notes_in_excluded_repository_is_skipped_with_hint() {
+    let (local, upstream) = filtered_repo_with_remote();
+    seed_remote_with_note(&upstream);
+
+    let output = local.git_ai(&["fetch-notes"]).unwrap();
+
+    assert!(output.contains("Skipped"), "{output}");
+    assert!(
+        output.contains("exclude_repositories pattern 'https://github.com/*'"),
+        "the hint names the matching pattern: {output}"
+    );
+    assert!(
+        output.contains("remove 'https://github.com/*' from exclude_repositories"),
+        "the hint offers editing the filter: {output}"
+    );
+    assert!(
+        output.contains(NATIVE_FETCH_HINT),
+        "the hint offers the native git fetch: {output}"
+    );
+    assert_eq!(notes_refs(&local), "", "nothing was fetched");
+}
+
+#[test]
+fn fetch_notes_outside_allowlist_hints_at_adding_the_url() {
+    let (local, upstream) = TestRepo::new_with_remote_with_daemon_scope(DaemonTestScope::Dedicated);
+    set_remote(&local, "origin", GITHUB_URL, upstream.path());
+    seed_remote_with_note(&upstream);
+    set_repository_filters(&local, &["https://gitlab.example.com/*"], &[]);
+
+    let output = local.git_ai(&["fetch-notes", "origin"]).unwrap();
+
+    assert!(
+        output.contains(&format!(
+            "git ai config --add allow_repositories {GITHUB_URL}"
+        )),
+        "{output}"
+    );
+    assert!(output.contains(NATIVE_FETCH_HINT), "{output}");
+    assert_eq!(notes_refs(&local), "");
+}
+
+#[test]
+fn fetch_notes_json_reports_skipped() {
+    let (local, upstream) = filtered_repo_with_remote();
+    seed_remote_with_note(&upstream);
+
+    let output = local.git_ai(&["fetch-notes", "--json"]).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+
+    assert_eq!(parsed["status"], "skipped", "{output}");
+    assert_eq!(parsed["remote"], "origin");
+    assert_eq!(notes_refs(&local), "");
+}
+
+#[test]
+fn fetch_notes_with_http_backend_hints_only_at_the_filters() {
+    let (local, _upstream) = filtered_repo_with_remote();
+    // Unroutable on purpose: the skip must happen before any backend request.
+    set_config_value(
+        &local,
+        "notes_backend",
+        json!({"kind": "http", "backend_url": "http://127.0.0.1:9"}),
+    );
+
+    let output = local.git_ai(&["fetch-notes"]).unwrap();
+
+    assert!(output.contains("remove 'https://github.com/*'"), "{output}");
+    assert!(
+        !output.contains("git fetch"),
+        "HTTP-backend notes are not in refs, so no native fetch is offered: {output}"
+    );
+}
+
+#[test]
+fn fetch_authorship_notes_machine_command_reports_skipped() {
+    let (local, upstream) = filtered_repo_with_remote();
+    seed_remote_with_note(&upstream);
+
+    let request = json!({"remote_name": "origin"}).to_string();
+    let output = local
+        .git_ai(&["fetch-authorship-notes", "--json", &request])
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+
+    assert_eq!(parsed["notes_existence"], "skipped", "{output}");
+    assert_eq!(notes_refs(&local), "");
+}
+
+/// Reads are not gated: notes the user fetched with plain git (the hint's
+/// second option) show up in `git ai blame` of an excluded repository.
+#[test]
+fn natively_fetched_notes_are_readable_in_excluded_repository() {
+    let (tracked, shared) = TestRepo::new_with_remote_with_daemon_scope(DaemonTestScope::Dedicated);
+    tracked
+        .filename("ai.txt")
+        .set_contents(vec!["line from an agent".ai()]);
+    let sha = commit_all(&tracked, "agent change");
+    tracked.git(&["push", "origin", "HEAD:main"]).unwrap();
+    tracked.sync_daemon_force();
+    assert!(
+        tracked
+            .read_authorship_note_in_git_dir(shared.path(), &sha)
+            .is_some(),
+        "precondition: the tracked repository pushed its note"
+    );
+
+    let (local, _unused) = TestRepo::new_with_remote_with_daemon_scope(DaemonTestScope::Dedicated);
+    set_remote(&local, "origin", GITHUB_URL, shared.path());
+    set_repository_filters(&local, &[], &["https://github.com/*"]);
+    local.git_og(&["fetch", "origin", "main"]).unwrap();
+    local.git_og(&["reset", "--hard", "FETCH_HEAD"]).unwrap();
+
+    local.git_ai(&["fetch-notes"]).unwrap();
+    assert_eq!(
+        notes_refs(&local),
+        "",
+        "precondition: git-ai fetched nothing"
+    );
+
+    local
+        .git_og(&["fetch", "origin", "refs/notes/ai:refs/notes/ai"])
+        .unwrap();
+    local
+        .filename("ai.txt")
+        .assert_lines_and_blame(vec!["line from an agent".ai()]);
+}

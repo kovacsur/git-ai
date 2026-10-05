@@ -782,6 +782,7 @@ fn notes_existence_label(existence: NotesExistence) -> &'static str {
     match existence {
         NotesExistence::Found => "found",
         NotesExistence::NotFound => "not_found",
+        NotesExistence::Skipped => "skipped",
     }
 }
 

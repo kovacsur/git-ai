@@ -8,7 +8,7 @@ use crate::git::refs::{
 use crate::git::repository::{
     CommitRange, Repository, exec_git, exec_git_allow_nonzero, exec_git_stdin,
 };
-use crate::git::sync_authorship::fetch_authorship_notes;
+use crate::git::sync_authorship::{NotesExistence, fetch_authorship_notes};
 use std::fs;
 use std::path::PathBuf;
 
@@ -119,8 +119,13 @@ impl CiContext {
                 } else {
                     println!("Fetching authorship history");
                     // Ensure we have the full authorship history before checking for existing notes
-                    fetch_authorship_notes(&self.repo, "origin")?;
-                    println!("Fetched authorship history");
+                    if fetch_authorship_notes(&self.repo, "origin")? == NotesExistence::Skipped {
+                        println!(
+                            "Skipped authorship history fetch: rejected by repository filters"
+                        );
+                    } else {
+                        println!("Fetched authorship history");
+                    }
                 }
 
                 // Check if authorship already exists for this commit
@@ -406,8 +411,13 @@ impl CiContext {
                     println!("Skipping authorship history fetch");
                 } else {
                     println!("Fetching authorship history");
-                    fetch_authorship_notes(&self.repo, "origin")?;
-                    println!("Fetched authorship history");
+                    if fetch_authorship_notes(&self.repo, "origin")? == NotesExistence::Skipped {
+                        println!(
+                            "Skipped authorship history fetch: rejected by repository filters"
+                        );
+                    } else {
+                        println!("Fetched authorship history");
+                    }
                 }
 
                 if previous_head_sha == head_sha {

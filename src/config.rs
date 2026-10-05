@@ -24,6 +24,16 @@ pub const DEFAULT_MAX_CHECKPOINT_TOTAL_LINES: usize = 500_000;
 pub(crate) const MEBIBYTE_BYTES: u64 = 1024 * 1024;
 pub(crate) const MAX_DAEMON_MEMORY_LIMIT_MB: u64 = u64::MAX / MEBIBYTE_BYTES;
 
+/// Why the repository filters reject syncing notes with a remote
+/// (see [`Config::notes_sync_rejection`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepositoryFilterRejection {
+    /// `url` matches the `exclude_repositories` pattern `pattern`.
+    Excluded { pattern: String, url: String },
+    /// `url` (if known) matches no `allow_repositories` pattern.
+    NotAllowed { url: Option<String> },
+}
+
 /// Which backend to use for storing authorship notes.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -461,6 +471,43 @@ impl Config {
         repository
             .remote_transfer_urls(remote)
             .is_ok_and(|urls| self.is_allowed_remote_urls(&urls))
+    }
+
+    /// Why [`Self::may_sync_notes_with_remote`] rejects `remote`, for user-facing
+    /// hints. `None` when notes may be synced. An exclude match on any remote of
+    /// the repository is reported first, because exclusions take precedence.
+    pub fn notes_sync_rejection(
+        &self,
+        repository: &Repository,
+        remote: &str,
+    ) -> Option<RepositoryFilterRejection> {
+        if self.may_sync_notes_with_remote(repository, remote) {
+            return None;
+        }
+        let mut urls = repository.remote_transfer_urls(remote).unwrap_or_default();
+        urls.extend(
+            repository
+                .remotes_with_urls()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, url)| url),
+        );
+        for url in &urls {
+            if let Some(pattern) = self
+                .exclude_repositories
+                .iter()
+                .find(|pattern| remote_matches_patterns(std::slice::from_ref(*pattern), url))
+            {
+                return Some(RepositoryFilterRejection::Excluded {
+                    pattern: pattern.as_str().to_string(),
+                    url: url.clone(),
+                });
+            }
+        }
+        let url = urls
+            .into_iter()
+            .find(|url| !remote_matches_patterns(&self.allow_repositories, url));
+        Some(RepositoryFilterRejection::NotAllowed { url })
     }
 
     pub(crate) fn is_allowed_remote_urls(&self, urls: &[String]) -> bool {
