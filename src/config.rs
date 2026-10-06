@@ -487,7 +487,7 @@ impl Config {
             return true;
         }
         // Fail closed: remotes that cannot be read cannot be checked.
-        let Ok(remotes) = repository.remotes_with_urls() else {
+        let Ok(remotes) = repository.remotes_with_all_urls() else {
             return false;
         };
         self.is_allowed_repository_with_remotes(Some(&remotes))
@@ -536,7 +536,7 @@ impl Config {
 
     fn repository_urls(repository: &Repository) -> Vec<String> {
         repository
-            .remotes_with_urls()
+            .remotes_with_all_urls()
             .unwrap_or_default()
             .into_iter()
             .map(|(_, url)| url)

@@ -1013,3 +1013,36 @@ fn ci_imports_no_notes_from_excluded_fork() {
         output
     );
 }
+
+/// Commit in a repository whose origin has two `url` values: GITHUB_URL, then
+/// GITLAB_URL (git fetches from the first and pushes to both). Returns the
+/// commit's authorship note.
+fn note_with_two_origin_urls(exclude: &[&str]) -> Option<String> {
+    let (local, upstream) = TestRepo::new_with_remote_with_daemon_scope(DaemonTestScope::Dedicated);
+    set_remote(&local, "origin", GITHUB_URL, upstream.path());
+    local
+        .git_og(&["config", "--add", "remote.origin.url", GITLAB_URL])
+        .unwrap();
+    set_repository_filters(&local, &[], exclude);
+
+    fs::write(local.path().join("human.txt"), "written by a human\n").unwrap();
+    let sha = commit_all(&local, "change with two origin urls");
+    local.read_authorship_note(&sha)
+}
+
+#[test]
+fn commit_with_two_unexcluded_origin_urls_writes_note() {
+    assert!(
+        note_with_two_origin_urls(&["https://other.example.com/*"]).is_some(),
+        "positive control: a repository none of whose URLs is excluded gets a note"
+    );
+}
+
+#[test]
+fn commit_writes_no_note_when_any_origin_url_is_excluded() {
+    assert_eq!(
+        note_with_two_origin_urls(&["https://github.com/*"]),
+        None,
+        "every url of a remote counts, not only the last one git config lists"
+    );
+}
