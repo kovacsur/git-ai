@@ -640,6 +640,17 @@ impl CiContext {
             println!("No PR commits found; skipping fork authorship note import");
             return Ok(0);
         }
+        // The fork URL is a remote like any other: the repository filters decide
+        // whether its notes may be fetched or copied in, preloaded ones included.
+        if let Some(rejection) =
+            crate::config::Config::fresh().notes_sync_rejection(&self.repo, fork_url)
+        {
+            println!(
+                "Skipping fork authorship note import: {}",
+                rejection.reason()
+            );
+            return Ok(0);
+        }
 
         let source_ref_available = if options.skip_fetch_fork_notes {
             println!(

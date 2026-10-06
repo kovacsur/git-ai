@@ -913,3 +913,103 @@ fn excluded_repository_rebase_records_no_rewrite_metrics() {
         "a rebase in an excluded repository must not record RewriteCommitted: {events:?}"
     );
 }
+
+/// Squash-merge a fork PR whose commit carries a git-ai note and run
+/// `git ai ci local merge` with `--fork-clone-url GITHUB_FORK_URL` (transport:
+/// the fork repo). The upstream repo's origin is GITLAB_URL. Returns the CI
+/// output and the notes refs the upstream repo ends up with.
+fn ci_fork_import_with_filters(exclude: &[&str]) -> (String, String) {
+    const GITHUB_FORK_URL: &str = "https://github.com/contributor/filtered.git";
+
+    let upstream = TestRepo::new_with_daemon_scope(DaemonTestScope::Dedicated);
+    fs::write(upstream.path().join("app.js"), "// App v1\n").unwrap();
+    upstream.git_og(&["add", "-A"]).unwrap();
+    upstream.git_og(&["commit", "-q", "-m", "base"]).unwrap();
+    upstream.git_og(&["branch", "-M", "main"]).unwrap();
+    let base_sha = head_sha(&upstream);
+    set_remote(&upstream, "origin", GITLAB_URL, upstream.path());
+
+    let fork = TestRepo::new();
+    fork.git_og(&["fetch", "-q", upstream.path().to_str().unwrap(), "main"])
+        .unwrap();
+    fork.git_og(&["checkout", "-q", "-b", "main", "FETCH_HEAD"])
+        .unwrap();
+    let mut fork_file = fork.filename("app.js");
+    fork_file.set_contents(lines!["// App v1", "// AI feature".ai()]);
+    let fork_head_sha = fork.stage_all_and_commit("AI feature").unwrap().commit_sha;
+    assert!(fork.read_authorship_note(&fork_head_sha).is_some());
+
+    upstream
+        .git_og(&[
+            "fetch",
+            "-q",
+            fork.path().to_str().unwrap(),
+            "main:refs/fork/main",
+        ])
+        .unwrap();
+    upstream
+        .git_og(&[
+            "config",
+            &format!("url.{}.insteadOf", fork.path().to_str().unwrap()),
+            GITHUB_FORK_URL,
+        ])
+        .unwrap();
+    fs::write(upstream.path().join("app.js"), "// App v1\n// AI feature\n").unwrap();
+    upstream.git_og(&["add", "-A"]).unwrap();
+    upstream
+        .git_og(&["commit", "-q", "-m", "Merge fork PR via squash"])
+        .unwrap();
+    let merge_sha = head_sha(&upstream);
+    set_repository_filters(&upstream, &[], exclude);
+
+    let output = upstream
+        .git_ai(&[
+            "ci",
+            "local",
+            "merge",
+            "--merge-commit-sha",
+            &merge_sha,
+            "--base-ref",
+            "main",
+            "--head-ref",
+            "main",
+            "--head-sha",
+            &fork_head_sha,
+            "--base-sha",
+            &base_sha,
+            "--fork-clone-url",
+            GITHUB_FORK_URL,
+            "--skip-fetch-notes",
+            "--skip-fetch-base",
+            "--skip-push",
+        ])
+        .unwrap_or_else(|err| err);
+    (output, notes_refs(&upstream))
+}
+
+#[test]
+fn ci_imports_notes_from_allowed_fork() {
+    let (output, refs) = ci_fork_import_with_filters(&["https://gitlab.example.com/fork/*"]);
+    assert!(
+        refs.lines().any(|r| r == "refs/notes/ai-remote/fork")
+            && refs.lines().any(|r| r == "refs/notes/ai"),
+        "positive control: CI fetches the fork's notes and rewrites them; refs:\n{}\noutput:\n{}",
+        refs,
+        output
+    );
+}
+
+#[test]
+fn ci_imports_no_notes_from_excluded_fork() {
+    let (output, refs) = ci_fork_import_with_filters(&["https://github.com/*"]);
+    assert_eq!(
+        refs, "",
+        "CI must not fetch or import notes from a fork URL the filters reject; output:\n{}",
+        output
+    );
+    assert!(
+        output.contains("https://github.com/contributor/filtered.git matches exclude_repositories pattern 'https://github.com/*'"),
+        "expected the skip to name the rule, got:\n{}",
+        output
+    );
+}
