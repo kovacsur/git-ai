@@ -673,9 +673,14 @@ impl CiContext {
                     false
                 }
                 Err(e) => {
+                    // The error quotes the git command line, i.e. the fork URL,
+                    // which carries the CI token.
                     println!(
                         "Warning: Failed to fetch fork notes ({}), continuing without them",
-                        e
+                        e.to_string().replace(
+                            fork_url.as_str(),
+                            &crate::config::url_without_credentials(fork_url)
+                        )
                     );
                     false
                 }

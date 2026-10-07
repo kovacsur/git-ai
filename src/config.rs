@@ -38,12 +38,15 @@ impl RepositoryFilterRejection {
     /// The rule that matched, e.g. `<url> matches exclude_repositories pattern '<p>'`.
     pub fn reason(&self) -> String {
         match self {
-            Self::Excluded { pattern, url } => {
-                format!("{} matches exclude_repositories pattern '{}'", url, pattern)
-            }
-            Self::NotAllowed { url: Some(url) } => {
-                format!("{} matches no allow_repositories pattern", url)
-            }
+            Self::Excluded { pattern, url } => format!(
+                "{} matches exclude_repositories pattern '{}'",
+                url_without_credentials(url),
+                pattern
+            ),
+            Self::NotAllowed { url: Some(url) } => format!(
+                "{} matches no allow_repositories pattern",
+                url_without_credentials(url)
+            ),
             Self::NotAllowed { url: None } => {
                 "its URL matches no allow_repositories pattern".to_string()
             }
@@ -57,13 +60,29 @@ impl RepositoryFilterRejection {
                 "remove '{}' from exclude_repositories (see 'git ai config exclude_repositories')",
                 pattern
             ),
-            Self::NotAllowed { url: Some(url) } => {
-                format!("allow it: git ai config --add allow_repositories {}", url)
-            }
+            Self::NotAllowed { url: Some(url) } => format!(
+                "allow it: git ai config --add allow_repositories {}",
+                url_without_credentials(url)
+            ),
             Self::NotAllowed { url: None } => {
                 "add it to allow_repositories (see 'git ai config allow_repositories')".to_string()
             }
         }
+    }
+}
+
+/// `url` without the `user:password@` part of a `scheme://` URL. CI passes
+/// fork and clone URLs with a token there (GitHub `x-access-token`, GitLab
+/// `gitlab-ci-token`), so messages that name a URL must not print it as is.
+/// Matching is unaffected: it ignores credentials already.
+pub(crate) fn url_without_credentials(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    match rest[..authority_end].rsplit_once('@') {
+        Some((_, host)) => format!("{}://{}{}", scheme, host, &rest[authority_end..]),
+        None => url.to_string(),
     }
 }
 
@@ -3054,5 +3073,46 @@ mod tests {
             None => unsafe { std::env::remove_var("GIT_AI_TRANSCRIPT_STREAMING_LOOKBACK_DAYS") },
         }
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn filter_rejection_messages_hide_url_credentials() {
+        let secret_url = "https://x-access-token:SECRET@github.com/acme/fork.git";
+        let excluded = RepositoryFilterRejection::Excluded {
+            pattern: "https://github.com/*".to_string(),
+            url: secret_url.to_string(),
+        };
+        let not_allowed = RepositoryFilterRejection::NotAllowed {
+            url: Some(
+                "https://gitlab-ci-token:SECRET@gitlab.example.com/acme/fork.git".to_string(),
+            ),
+        };
+        for message in [
+            excluded.reason(),
+            excluded.how_to_change_filters(),
+            not_allowed.reason(),
+            not_allowed.how_to_change_filters(),
+        ] {
+            assert!(
+                !message.contains("SECRET"),
+                "credentials leaked: {}",
+                message
+            );
+        }
+        assert!(
+            excluded
+                .reason()
+                .contains("https://github.com/acme/fork.git")
+        );
+        assert!(
+            not_allowed
+                .how_to_change_filters()
+                .contains("https://gitlab.example.com/acme/fork.git")
+        );
+        // scp-like URLs carry a user name, not a secret: unchanged.
+        let scp = RepositoryFilterRejection::NotAllowed {
+            url: Some("git@github.com:acme/repo.git".to_string()),
+        };
+        assert!(scp.reason().contains("git@github.com:acme/repo.git"));
     }
 }

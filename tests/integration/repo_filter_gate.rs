@@ -915,12 +915,17 @@ fn excluded_repository_rebase_records_no_rewrite_metrics() {
 }
 
 /// Squash-merge a fork PR whose commit carries a git-ai note and run
-/// `git ai ci local merge` with `--fork-clone-url GITHUB_FORK_URL` (transport:
-/// the fork repo). The upstream repo's origin is GITLAB_URL. Returns the CI
-/// output and the notes refs the upstream repo ends up with.
+/// `git ai ci local merge` with `--fork-clone-url
+/// https://github.com/contributor/filtered.git` (transport: the fork repo).
+/// The upstream repo's origin is GITLAB_URL. Returns the CI output and the
+/// notes refs the upstream repo ends up with.
 fn ci_fork_import_with_filters(exclude: &[&str]) -> (String, String) {
-    const GITHUB_FORK_URL: &str = "https://github.com/contributor/filtered.git";
+    ci_fork_import(exclude, "https://github.com/contributor/filtered.git", true)
+}
 
+/// [`ci_fork_import_with_filters`] with `--fork-clone-url fork_url`, whose
+/// transport is the fork repo only if `route_to_fork`.
+fn ci_fork_import(exclude: &[&str], fork_url: &str, route_to_fork: bool) -> (String, String) {
     let upstream = TestRepo::new_with_daemon_scope(DaemonTestScope::Dedicated);
     fs::write(upstream.path().join("app.js"), "// App v1\n").unwrap();
     upstream.git_og(&["add", "-A"]).unwrap();
@@ -947,13 +952,15 @@ fn ci_fork_import_with_filters(exclude: &[&str]) -> (String, String) {
             "main:refs/fork/main",
         ])
         .unwrap();
-    upstream
-        .git_og(&[
-            "config",
-            &format!("url.{}.insteadOf", fork.path().to_str().unwrap()),
-            GITHUB_FORK_URL,
-        ])
-        .unwrap();
+    if route_to_fork {
+        upstream
+            .git_og(&[
+                "config",
+                &format!("url.{}.insteadOf", fork.path().to_str().unwrap()),
+                fork_url,
+            ])
+            .unwrap();
+    }
     fs::write(upstream.path().join("app.js"), "// App v1\n// AI feature\n").unwrap();
     upstream.git_og(&["add", "-A"]).unwrap();
     upstream
@@ -978,7 +985,7 @@ fn ci_fork_import_with_filters(exclude: &[&str]) -> (String, String) {
             "--base-sha",
             &base_sha,
             "--fork-clone-url",
-            GITHUB_FORK_URL,
+            fork_url,
             "--skip-fetch-notes",
             "--skip-fetch-base",
             "--skip-push",
@@ -1044,5 +1051,26 @@ fn commit_writes_no_note_when_any_origin_url_is_excluded() {
         note_with_two_origin_urls(&["https://github.com/*"]),
         None,
         "every url of a remote counts, not only the last one git config lists"
+    );
+}
+
+#[test]
+fn ci_fork_fetch_failure_does_not_print_url_credentials() {
+    // Port 9 (discard) on loopback refuses the connection: the fetch fails
+    // without leaving the machine.
+    let (output, _refs) = ci_fork_import(
+        &[],
+        "https://x-access-token:SECRET@127.0.0.1:9/fork.git",
+        false,
+    );
+    assert!(
+        output.contains("Failed to fetch fork notes"),
+        "expected the fetch to fail, got:\n{}",
+        output
+    );
+    assert!(
+        !output.contains("SECRET"),
+        "CI output must not contain the fork URL's credentials:\n{}",
+        output
     );
 }
